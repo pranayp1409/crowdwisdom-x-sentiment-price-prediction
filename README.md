@@ -185,3 +185,15 @@ python -m pytest -q
 
 Generated data, reports, fitted models, virtual environments, and credentials are
 excluded from Git by `.gitignore`.
+
+## Output
+<img width="1911" height="836" alt="Screenshot 2026-11-13 233054" src="https://github.com/user-attachments/assets/9b2c03d3-c116-4725-8951-0a1873d466bb" />
+
+<img width="1903" height="842" alt="image" src="https://github.com/user-attachments/assets/5b6a0e5b-3c42-481b-b960-6f867dad1ab5" />
+
+<img width="1906" height="773" alt="image" src="https://github.com/user-attachments/assets/520c2018-6296-4a2a-8bc7-aab38d5444cb" />
+
+<img width="1911" height="903" alt="image" src="https://github.com/user-attachments/assets/a4cbff44-8103-4b4c-b028-7d69ec58a5be" />
+
+
+
