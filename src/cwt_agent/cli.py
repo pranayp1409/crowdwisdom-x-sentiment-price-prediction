@@ -15,7 +15,7 @@ from cwt_agent.providers import (
     fetch_prices,
     fetch_tweets,
     limit_tweets_to_lookback,
-    normalize_tweets,
+    parse_tweet_export,
 )
 from cwt_agent.reports import create_charts, write_evaluation_report, write_sentiment_summary
 
@@ -151,20 +151,10 @@ def report(
 def _load_tweet_file(path: Path) -> list[dict]:
     if not path.is_file():
         raise FileNotFoundError(f"Tweet file does not exist: {path}")
-    if path.suffix.lower() == ".csv":
-        records = pd.read_csv(path).to_dict(orient="records")
-    elif path.suffix.lower() in {".json", ".jsonl"}:
-        if path.suffix.lower() == ".jsonl":
-            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        else:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            records = payload if isinstance(payload, list) else payload.get("data", [])
-    else:
-        raise ValueError("Tweet import supports CSV, JSON, or JSONL files.")
-    rows = normalize_tweets(records)
-    if not rows:
-        raise ValueError("No valid posts found; ensure the file has text and timestamp columns.")
-    return rows
+    try:
+        return parse_tweet_export(path.name, path.read_bytes())
+    except ValueError as error:
+        raise ValueError(f"Could not import {path}: {error}") from error
 
 
 def _asset_name(asset: str) -> str:

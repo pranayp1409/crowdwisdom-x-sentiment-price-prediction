@@ -15,7 +15,13 @@ from cwt_agent.config import Settings
 from cwt_agent.database import Database
 from cwt_agent.features import sentiment_coverage
 from cwt_agent.model import metrics_from_predictions
-from cwt_agent.providers import fetch_news, fetch_prices, fetch_tweets
+from cwt_agent.providers import (
+    fetch_news,
+    fetch_prices,
+    fetch_tweets,
+    limit_tweets_to_lookback,
+    parse_tweet_export,
+)
 
 
 STOP_WORDS = {
@@ -104,18 +110,25 @@ def main() -> None:
     predictions = _load_predictions(selected_settings)
     forecasts = _load_forecasts(selected_settings)
     metrics = metrics_from_predictions(predictions, interval)
+    st.markdown(
+        '<div class="eyebrow">MARKET INTELLIGENCE · SENTIMENT & QUANT</div>',
+        unsafe_allow_html=True,
+    )
+    st.title(f"{asset}  /  Sentiment overview")
     if not prices.empty:
         latest_time = pd.Timestamp(prices.index[-1])
-        recent_posts, recent_score = _recent_sentiment(tweets)
-        st.markdown(
-            '<div class="eyebrow">MARKET INTELLIGENCE · SENTIMENT & QUANT</div>',
-            unsafe_allow_html=True,
-        )
-        st.title(f"{asset}  /  Sentiment overview")
         st.caption(
             f"Research dashboard · {interval} bars · latest stored price bar "
             f"{latest_time.strftime('%Y-%m-%d %H:%M UTC')}"
         )
+    else:
+        st.info("No price bars are stored for this asset yet. Use **Refresh data** to ingest prices.")
+
+    if _render_tweet_import(database, asset, settings.lookback_days, tweets.empty):
+        tweets = database.load_tweets(asset)
+
+    if not prices.empty:
+        recent_posts, recent_score = _recent_sentiment(tweets)
         _render_live_metrics(prices, recent_posts, recent_score)
         _render_data_quality(prices, tweets, interval)
         _render_price_sentiment(prices, tweets, interval, window_days)
@@ -124,13 +137,52 @@ def main() -> None:
         _render_walk_forward(predictions, metrics)
         _render_news(news)
         _render_recent_posts(tweets)
-    else:
-        st.markdown(
-            '<div class="eyebrow">MARKET INTELLIGENCE · SENTIMENT & QUANT</div>',
-            unsafe_allow_html=True,
+
+
+def _render_tweet_import(
+    database: Database, asset: str, lookback_days: int, expand_by_default: bool
+) -> bool:
+    imported = False
+    with st.expander("Import historical X posts", expanded=expand_by_default):
+        st.caption(
+            "Upload an Apify CSV, JSON, or JSONL export with post text and timestamps. "
+            f"Only posts from the last {lookback_days} days are imported."
         )
-        st.title(f"{asset}  /  Sentiment overview")
-        st.info("No price bars are stored for this asset yet. Use **Refresh data** to ingest prices.")
+        with st.form("tweet_export_import"):
+            uploaded_file = st.file_uploader(
+                "Choose a post export",
+                type=["csv", "json", "jsonl"],
+                help="Expected fields include text and createdAt (or supported aliases).",
+                key="tweet_export_upload",
+            )
+            submitted = st.form_submit_button("Import posts", width="stretch")
+        if submitted:
+            if uploaded_file is None:
+                st.error("Choose a CSV, JSON, or JSONL file before importing.")
+            else:
+                try:
+                    rows = parse_tweet_export(uploaded_file.name, uploaded_file.getvalue())
+                    in_window = limit_tweets_to_lookback(rows, lookback_days)
+                    if not in_window:
+                        st.error(
+                            f"Found {len(rows)} valid posts, but none are within the last "
+                            f"{lookback_days} days. Check the export timestamps."
+                        )
+                    else:
+                        database.save_tweets(asset, in_window)
+                        ignored = len(rows) - len(in_window)
+                        st.success(
+                            f"Imported {len(in_window)} posts for {asset}."
+                            + (
+                                f" Ignored {ignored} posts outside the lookback window."
+                                if ignored
+                                else ""
+                            )
+                        )
+                        imported = True
+                except ValueError as error:
+                    st.error(f"Could not import the post export: {error}")
+    return imported
 
 
 def _render_live_metrics(prices: pd.DataFrame, posts: pd.DataFrame, score: float) -> None:

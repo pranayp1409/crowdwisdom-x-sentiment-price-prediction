@@ -138,6 +138,14 @@ database and saved model outputs. **Refresh data** fetches new provider data; ru
 If a provider refresh fails, the dashboard displays the error and keeps rendering any
 previously stored data.
 
+To load real X posts without starting an Apify run, open **Import historical X posts**
+on the dashboard, choose a CSV, JSON, or JSONL export, then submit the form. The file
+must contain post text and timestamps (for example `text` and `createdAt`; common
+aliases are supported). The dashboard imports only posts within `LOOKBACK_DAYS` for
+the currently selected asset, then immediately refreshes the sentiment views. Streamlit
+Cloud does not share the local database, and its app-local SQLite data may be lost when
+the hosted app is restarted or redeployed; keep the source export so you can re-import it.
+
 ## Evaluation notes and limitations
 
 - `n+0` is the latest observed completed bar close; it is not a model prediction.

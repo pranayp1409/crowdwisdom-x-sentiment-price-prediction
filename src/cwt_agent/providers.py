@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import math
@@ -110,9 +111,15 @@ def normalize_tweets(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ("createdAt", "created_at", "timestamp", "date", "postedAt"),
             None,
         )
+        if text is None or (not isinstance(text, (dict, list)) and pd.isna(text)):
+            continue
         if isinstance(text, dict):
             text = text.get("text", "")
-        if not str(text).strip() or timestamp is None:
+        if (
+            not str(text).strip()
+            or timestamp is None
+            or (not isinstance(timestamp, (dict, list)) and pd.isna(timestamp))
+        ):
             continue
         try:
             timestamp_iso = _utc_iso(timestamp)
@@ -145,6 +152,72 @@ def normalize_tweets(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def parse_tweet_export(file_name: str, content: bytes) -> list[dict[str, Any]]:
+    suffix = file_name.lower().rsplit(".", maxsplit=1)[-1] if "." in file_name else ""
+    if suffix == "csv":
+        try:
+            records = pd.read_csv(io.BytesIO(content)).to_dict(orient="records")
+        except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as error:
+            raise ValueError(f"Could not read the CSV export: {error}") from error
+    elif suffix in {"json", "jsonl"}:
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise ValueError("The export must be UTF-8 encoded.") from error
+        if suffix == "jsonl":
+            records = []
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"Invalid JSON on line {line_number}: {error.msg}."
+                    ) from error
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"Expected a JSON object on line {line_number} of the JSONL export."
+                    )
+                records.append(record)
+        else:
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON export: {error.msg}.") from error
+            if isinstance(payload, list):
+                records = payload
+            elif isinstance(payload, dict):
+                records = next(
+                    (
+                        payload[key]
+                        for key in ("data", "items", "tweets")
+                        if isinstance(payload.get(key), list)
+                    ),
+                    None,
+                )
+                if records is None:
+                    records = [payload]
+            else:
+                raise ValueError("JSON export must contain an array or an object of posts.")
+    else:
+        raise ValueError("Upload a CSV, JSON, or JSONL post export.")
+
+    if not records:
+        raise ValueError("The uploaded export contains no post records.")
+    if not all(isinstance(record, dict) for record in records):
+        raise ValueError("Each post in the uploaded export must be a JSON object or CSV row.")
+    rows = normalize_tweets(records)
+    if not rows:
+        fields = sorted({field for record in records[:5] for field in record})
+        raise ValueError(
+            "No usable posts found. Each row needs recognized text and timestamp fields "
+            "(for example `text` and `createdAt`). "
+            f"Fields found: {fields or 'none'}."
+        )
+    return list({row["id"]: row for row in rows}.values())
 
 
 def limit_tweets_to_lookback(

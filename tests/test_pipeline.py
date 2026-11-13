@@ -8,6 +8,7 @@ import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from cwt_agent.config import Settings
+from cwt_agent.database import Database
 from cwt_agent.features import build_feature_frame
 from cwt_agent.features import sentiment_coverage
 from cwt_agent.model import _metrics, metrics_from_predictions, train_and_evaluate
@@ -17,6 +18,7 @@ from cwt_agent.providers import (
     fetch_tweets,
     limit_tweets_to_lookback,
     normalize_tweets,
+    parse_tweet_export,
 )
 from cwt_agent.reports import create_charts, write_sentiment_summary
 
@@ -45,6 +47,43 @@ def test_normalize_tweets_maps_common_actor_fields() -> None:
             "followers": 100.0,
         }
     ]
+
+
+def test_parse_tweet_export_supports_csv_json_and_jsonl() -> None:
+    timestamp = pd.Timestamp.now(tz="UTC").isoformat()
+    csv_rows = parse_tweet_export(
+        "posts.csv",
+        f"id,text,createdAt\n1,Bitcoin is bullish,{timestamp}\n".encode(),
+    )
+    json_rows = parse_tweet_export(
+        "posts.json",
+        (
+            '[{"id":"2","fullText":"BTC update","createdAt":"'
+            + timestamp
+            + '"}]'
+        ).encode(),
+    )
+    jsonl_rows = parse_tweet_export(
+        "posts.jsonl",
+        (
+            '{"id":"3","text":"BTC rises","createdAt":"'
+            + timestamp
+            + '"}\n'
+        ).encode(),
+    )
+
+    assert [row["id"] for row in csv_rows] == ["1"]
+    assert [row["id"] for row in json_rows] == ["2"]
+    assert [row["id"] for row in jsonl_rows] == ["3"]
+
+
+def test_parse_tweet_export_reports_invalid_shape_and_jsonl_line() -> None:
+    with pytest.raises(ValueError, match="text and timestamp"):
+        parse_tweet_export("posts.json", b'[{"demo":true}]')
+    with pytest.raises(ValueError, match="line 2"):
+        parse_tweet_export("posts.jsonl", b'{"text":"ok"}\n{bad json}\n')
+    with pytest.raises(ValueError, match="CSV, JSON, or JSONL"):
+        parse_tweet_export("posts.txt", b"posts")
 
 
 def test_limit_tweets_to_lookback_excludes_old_and_future_posts() -> None:
@@ -463,6 +502,39 @@ def test_sentiment_features_are_equal_weight_and_mark_missing_bars() -> None:
     assert coverage["post_count"] == 2
     assert coverage["active_periods"] == 1
     assert coverage["bar_count"] == 30
+
+
+def test_dashboard_imports_uploaded_tweet_file(monkeypatch, tmp_path) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=tmp_path / "dashboard.sqlite3",
+        artifacts_dir=tmp_path / "models",
+        reports_dir=tmp_path / "reports",
+        apify_api_token=None,
+        apify_actor_id=None,
+        apify_input_json=None,
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+    monkeypatch.setattr(Settings, "from_env", classmethod(lambda cls: settings))
+    app_path = Path(__file__).parents[1] / "src" / "cwt_agent" / "dashboard.py"
+    app = AppTest.from_file(str(app_path)).run()
+    assert not app.exception
+
+    timestamp = pd.Timestamp.now(tz="UTC").isoformat()
+    csv_content = f"id,text,createdAt\npost-1,BTC update,{timestamp}\n".encode()
+    app.file_uploader(key="tweet_export_upload").upload("posts.csv", csv_content)
+    app.form_submit_button[0].click().run()
+
+    assert not app.exception
+    assert app.success[0].value == "Imported 1 posts for BTC-USD."
+    imported = Database(settings.database_path).load_tweets("BTC-USD")
+    assert len(imported) == 1
+    assert imported.iloc[0]["text"] == "BTC update"
 
 
 def test_monthly_apify_windows_are_contiguous_and_expand_over_lookback() -> None:
