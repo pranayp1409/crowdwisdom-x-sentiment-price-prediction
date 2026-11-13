@@ -222,15 +222,42 @@ def fetch_tweets(settings: Settings) -> list[dict[str, Any]]:
                     f"{window_input['start']} through {window_input['end']}."
                 ) from error
             raise
-    rows = limit_tweets_to_lookback(normalize_tweets(records), settings.lookback_days)
+    normalized_rows = normalize_tweets(records)
+    if not normalized_rows:
+        if not records:
+            result_detail = "the Actor returned zero dataset records"
+        else:
+            field_names = sorted(
+                {name for record in records[:5] for name in record}
+            )
+            result_detail = (
+                f"the Actor returned {len(records)} dataset records, but none had "
+                "recognized non-empty text and timestamp fields. "
+                f"Fields in the first records: {field_names or 'none'}."
+            )
+        raise RuntimeError(
+            f"Apify collection completed for {len(actor_inputs)} input(s): "
+            f"{result_detail} Check the Actor run datasets and input schema."
+        )
+
+    rows = limit_tweets_to_lookback(normalized_rows, settings.lookback_days)
     rows_by_id = {row["id"]: row for row in rows}
     rows = list(rows_by_id.values())
     if windows:
         _warn_about_empty_search_windows(rows, windows)
     if not rows:
+        timestamps = pd.to_datetime(
+            [row["timestamp"] for row in normalized_rows], utc=True, errors="coerce"
+        ).dropna()
+        returned_range = (
+            f"{timestamps.min().isoformat()} through {timestamps.max().isoformat()} UTC"
+            if not timestamps.empty
+            else "an unrecognized timestamp range"
+        )
         raise RuntimeError(
-            "Apify returned no valid posts within LOOKBACK_DAYS. Check APIFY_INPUT_JSON "
-            "and the selected actor's output schema and date range."
+            f"Apify returned {len(normalized_rows)} valid posts, but none fell within "
+            f"the last {settings.lookback_days} days ({returned_range}). Check the "
+            "Actor's start/end date filters, timezone, and the requested lookback."
         )
     return rows
 

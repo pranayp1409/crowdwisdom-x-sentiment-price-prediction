@@ -293,6 +293,51 @@ def test_apify_rejects_unpaired_start_end_fields(monkeypatch) -> None:
         fetch_tweets(settings)
 
 
+def test_apify_empty_dataset_error_explains_no_records(monkeypatch) -> None:
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=Path("unused.sqlite3"),
+        artifacts_dir=Path("unused-models"),
+        reports_dir=Path("unused-reports"),
+        apify_api_token="unit-test-token",
+        apify_actor_id="apidojo/twitter-scraper-lite",
+        apify_input_json='{"searchTerms":["BTC"]}',
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+    monkeypatch.setattr("cwt_agent.providers._run_apify_actor", lambda *args: [])
+
+    with pytest.raises(RuntimeError, match="returned zero dataset records"):
+        fetch_tweets(settings)
+
+
+def test_apify_unknown_output_schema_is_reported(monkeypatch) -> None:
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=Path("unused.sqlite3"),
+        artifacts_dir=Path("unused-models"),
+        reports_dir=Path("unused-reports"),
+        apify_api_token="unit-test-token",
+        apify_actor_id="apidojo/twitter-scraper-lite",
+        apify_input_json='{"searchTerms":["BTC"]}',
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+    monkeypatch.setattr(
+        "cwt_agent.providers._run_apify_actor",
+        lambda *args: [{"tweet_text": "BTC update", "created": "2026-06-01"}],
+    )
+
+    with pytest.raises(RuntimeError, match="recognized non-empty text and timestamp") as error:
+        fetch_tweets(settings)
+    assert "created" in str(error.value)
+    assert "tweet_text" in str(error.value)
+
+
 def test_apify_dataset_is_paginated_until_short_page(monkeypatch) -> None:
     import cwt_agent.providers as providers
 

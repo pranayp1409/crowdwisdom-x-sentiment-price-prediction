@@ -41,6 +41,20 @@ are optional; if you do not configure a news provider, use `--skip-news`. **Neve
 credentials into chat or commit `.env`.** The `.env.example` file contains placeholders,
 not working credentials.
 
+For Streamlit Community Cloud, add the same settings as root-level TOML entries in the
+app's **Settings → Secrets**. For example:
+
+```toml
+APIFY_API_TOKEN = "your-rotated-token"
+APIFY_ACTOR_ID = "apidojo/twitter-scraper-lite"
+APIFY_INPUT_JSON = '{"searchTerms":["BTC"],"sort":"Latest","maxItems":20,"includeSearchTerms":false,"start":"{{since}}","end":"{{until}}"}'
+```
+
+Do not include the example token literally. Save the secrets and reboot the app after
+changing them. Streamlit Cloud does not receive your local `.env` or SQLite database;
+the hosted dashboard starts with its own local database and must be populated by a data
+refresh or an import workflow.
+
 ## Run the pipeline
 
 Fetch prices and X data, skip optional news, train/evaluate, and generate reports:
@@ -94,7 +108,9 @@ posts by ID.
 Review current Actor pricing before collecting. Test one or two date windows in Apify
 Console first, confirm returned timestamps match the requested dates, and keep an
 appropriate maximum-cost limit enabled. Verify whether the provider's cost limit applies
-to API-triggered runs. `maxItems` is the Actor-side result cap **per window**;
+to API-triggered runs. The dashboard's **Refresh data** button starts the configured
+collection, so it may incur the cost of all monthly runs. `maxItems` is the Actor-side
+result cap **per window**;
 `APIFY_MAX_DATASET_ITEMS` is the client-side dataset download cap **per run**. Neither
 setting guarantees broad date coverage. Increase result limits only after checking the
 Actor's pricing and the pilot results.
@@ -119,6 +135,8 @@ news summaries, six displayed price points (`n+0` plus five future horizons),
 model metrics, and walk-forward validation results. It reads the configured SQLite
 database and saved model outputs. **Refresh data** fetches new provider data; run
 `cwt-agent train` separately to refresh forecasts and evaluation metrics.
+If a provider refresh fails, the dashboard displays the error and keeps rendering any
+previously stored data.
 
 ## Evaluation notes and limitations
 

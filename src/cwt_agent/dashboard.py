@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -61,20 +62,41 @@ def main() -> None:
     )
     selected_settings = replace(settings, asset=asset, interval=interval)
     st.sidebar.divider()
-    st.sidebar.caption("Credentials are read locally from `.env` and never shown here.")
+    st.sidebar.caption(
+        "Credentials are loaded from `.env` or deployment secrets and never shown here."
+    )
     if st.sidebar.button("↻  Refresh data", width="stretch", type="primary"):
+        refresh_errors: list[str] = []
         with st.spinner("Refreshing price, X, and news data…"):
-            prices = fetch_prices(selected_settings)
-            database.save_prices(asset, prices)
+            try:
+                prices = fetch_prices(selected_settings)
+                database.save_prices(asset, prices)
+            except (requests.RequestException, RuntimeError, TimeoutError, ValueError) as error:
+                refresh_errors.append(f"Price refresh failed: {error}")
             if selected_settings.apify_api_token and selected_settings.apify_actor_id:
-                database.save_tweets(asset, fetch_tweets(selected_settings))
+                try:
+                    database.save_tweets(asset, fetch_tweets(selected_settings))
+                except (
+                    requests.RequestException,
+                    RuntimeError,
+                    TimeoutError,
+                    ValueError,
+                ) as error:
+                    refresh_errors.append(f"X refresh failed: {error}")
             else:
                 st.sidebar.info("Apify is not configured; X posts were not refreshed.")
             if selected_settings.tavily_api_key or selected_settings.exa_api_key:
-                database.save_news(asset, fetch_news(selected_settings))
+                try:
+                    database.save_news(asset, fetch_news(selected_settings))
+                except (requests.RequestException, RuntimeError, TimeoutError, ValueError) as error:
+                    refresh_errors.append(f"News refresh failed: {error}")
             else:
                 st.sidebar.info("No news provider is configured; saved news was left unchanged.")
-        st.rerun()
+        if refresh_errors:
+            for error in refresh_errors:
+                st.error(error)
+        else:
+            st.rerun()
 
     prices = database.load_prices(asset)
     tweets = database.load_tweets(asset)
