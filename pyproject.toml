@@ -31,6 +31,9 @@ cwt-dashboard = "cwt_agent.dashboard:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.poetry]
+packages = [{ include = "cwt_agent", from = "src" }]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
