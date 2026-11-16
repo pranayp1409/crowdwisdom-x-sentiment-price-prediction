@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 
+from cwt_agent.archive_data import aggregate_bitcoin_tweet_archive
 from cwt_agent.config import Settings
 from cwt_agent.database import Database
 from cwt_agent.features import build_feature_frame, sentiment_coverage
@@ -18,6 +20,7 @@ from cwt_agent.providers import (
     parse_tweet_export,
 )
 from cwt_agent.reports import create_charts, write_evaluation_report, write_sentiment_summary
+from cwt_agent.sentiment_model import train_sentiment_classifier
 
 
 def main() -> None:
@@ -35,6 +38,27 @@ def main() -> None:
         help="Import historical actor-style CSV or JSON posts in addition to live X posts.",
     )
     subparsers.add_parser("train", help="Train models and run walk-forward evaluation.")
+    sentiment_parser = subparsers.add_parser(
+        "train-sentiment",
+        help="Train a local sentiment classifier from a Sentiment140 CSV.",
+    )
+    sentiment_parser.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        help="Path to the headerless Sentiment140 CSV.",
+    )
+    archive_parser = subparsers.add_parser(
+        "train-btc-archive",
+        help="Train daily BTC forecasts using a streamed historical Bitcoin tweet archive.",
+    )
+    archive_parser.add_argument(
+        "--tweets-file",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more CSV tweet archives with date/timestamp and text columns.",
+    )
     subparsers.add_parser("report", help="Write the current sentiment summary and charts.")
     run_parser = subparsers.add_parser("run", help="Ingest, train, and generate reports.")
     run_parser.add_argument("--tweets-file", type=Path)
@@ -48,6 +72,16 @@ def main() -> None:
         ingest(settings, database, args.skip_x, args.skip_news, args.tweets_file)
     elif args.command == "train":
         train(settings, database)
+    elif args.command == "train-sentiment":
+        metrics = train_sentiment_classifier(
+            args.dataset,
+            settings.sentiment_model_path,
+            settings.reports_dir / "sentiment_model_evaluation.json",
+        )
+        print(f"Sentiment classifier saved to {settings.sentiment_model_path}.")
+        print(json.dumps(metrics, indent=2))
+    elif args.command == "train-btc-archive":
+        train_btc_archive(settings, database, args.tweets_file)
     elif args.command == "report":
         report(settings, database, pd.DataFrame())
     elif args.command == "run":
@@ -105,7 +139,14 @@ def train(
 ) -> tuple[dict, pd.DataFrame, dict[str, float]]:
     prices = database.load_prices(settings.asset)
     tweets = database.load_tweets(settings.asset)
-    frame, feature_columns = build_feature_frame(prices, tweets, settings.interval)
+    sentiment_model_path = (
+        settings.sentiment_model_path
+        if settings.sentiment_model_path.is_file()
+        else None
+    )
+    frame, feature_columns = build_feature_frame(
+        prices, tweets, settings.interval, sentiment_model_path
+    )
     metrics, predictions, forecasts = train_and_evaluate(
         frame,
         feature_columns,
@@ -125,8 +166,123 @@ def train(
         forecasts,
         evaluation_path,
         coverage,
+        "Sentiment140 classifier" if sentiment_model_path else "VADER",
     )
     print(f"Walk-forward evaluation and forecasts written to {settings.reports_dir}.")
+    print(json.dumps(metrics, indent=2))
+    return metrics, predictions, forecasts
+
+
+def train_btc_archive(
+    settings: Settings,
+    database: Database,
+    tweets_files: list[Path],
+) -> tuple[dict, pd.DataFrame, dict[str, float]]:
+    if settings.asset != "BTC-USD":
+        raise ValueError("The Bitcoin tweet archive can only be used with ASSET=BTC-USD.")
+    missing_files = [path for path in tweets_files if not path.is_file()]
+    if missing_files:
+        raise FileNotFoundError(
+            "Tweet archive file(s) do not exist: "
+            + ", ".join(str(path) for path in missing_files)
+        )
+    if not settings.sentiment_model_path.is_file():
+        raise FileNotFoundError(
+            f"Sentiment model not found at {settings.sentiment_model_path}. "
+            "Run `cwt-agent train-sentiment` first."
+        )
+
+    archive_artifacts_dir = settings.artifacts_dir / "btc_archive_daily"
+    archive_reports_dir = settings.reports_dir / "btc_archive_daily"
+    daily_settings = replace(settings, interval="daily", lookback_days=4_500)
+    price_rows = fetch_prices(daily_settings)
+    prices = pd.DataFrame(price_rows)
+    prices["timestamp"] = pd.to_datetime(prices["timestamp"], utc=True)
+    prices = prices.set_index("timestamp")
+    historical_sentiment, archive_stats = aggregate_bitcoin_tweet_archive(
+        tweets_files,
+        settings.sentiment_model_path,
+        prices.index.min(),
+        prices.index.max(),
+        progress=lambda rows: print(f"Scanned {rows:,} rows from the Bitcoin archive."),
+    )
+    tweets = database.load_tweets(settings.asset)
+    frame, feature_columns = build_feature_frame(
+        prices,
+        tweets,
+        "daily",
+        sentiment_model_path=settings.sentiment_model_path,
+        precomputed_sentiment=historical_sentiment,
+    )
+    metrics, predictions, forecasts = train_and_evaluate(
+        frame,
+        feature_columns,
+        settings.asset,
+        "daily",
+        archive_artifacts_dir,
+        archive_reports_dir,
+    )
+    historical_sentiment_path = archive_artifacts_dir / "daily_archive_sentiment.csv"
+    historical_sentiment.to_csv(historical_sentiment_path)
+    current_coverage = sentiment_coverage(prices, tweets, "daily")
+    archive_days = int(archive_stats["active_days"])
+    combined_days = archive_days + int(current_coverage["active_days"])
+    active_periods = int(archive_stats["active_days"]) + int(
+        current_coverage["active_periods"]
+    )
+    first_posts = [
+        value
+        for value in (
+            archive_stats["first_post_utc"],
+            current_coverage["first_post_utc"],
+        )
+        if value
+    ]
+    last_posts = [
+        value
+        for value in (
+            archive_stats["last_post_utc"],
+            current_coverage["last_post_utc"],
+        )
+        if value
+    ]
+    coverage = {
+        "post_count": int(archive_stats["scored_rows"])
+        + int(current_coverage["post_count"]),
+        "active_periods": active_periods,
+        "bar_count": int(current_coverage["bar_count"]),
+        "bar_coverage_pct": (
+            active_periods / int(current_coverage["bar_count"]) * 100
+            if current_coverage["bar_count"]
+            else 0.0
+        ),
+        "active_days": combined_days,
+        "first_post_utc": min(first_posts) if first_posts else None,
+        "last_post_utc": max(last_posts) if last_posts else None,
+    }
+    evaluation_path = archive_reports_dir / f"{_asset_name(settings.asset)}_daily_evaluation.md"
+    write_evaluation_report(
+        settings.asset,
+        "daily",
+        metrics,
+        forecasts,
+        evaluation_path,
+        coverage,
+        "Sentiment140 classifier applied to historical BTC tweets",
+    )
+    print(
+        f"Scored {archive_stats['scored_rows']:,} Bitcoin-related posts across "
+        f"{archive_stats['active_days']:,} historical days "
+        f"({archive_stats['first_post_utc']} to {archive_stats['last_post_utc']})."
+    )
+    if archive_stats["overlapping_days_skipped"]:
+        print(
+            f"Skipped {archive_stats['overlapping_rows_skipped']:,} posts on "
+            f"{archive_stats['overlapping_days_skipped']:,} days already represented "
+            "in an earlier archive file."
+        )
+    print(f"Historical daily sentiment aggregates saved to {historical_sentiment_path}.")
+    print(f"Walk-forward evaluation and forecasts written to {archive_reports_dir}.")
     print(json.dumps(metrics, indent=2))
     return metrics, predictions, forecasts
 

@@ -46,14 +46,17 @@ app's **Settings → Secrets**. For example:
 
 ```toml
 APIFY_API_TOKEN = "your-rotated-token"
-APIFY_ACTOR_ID = "apidojo/twitter-scraper-lite"
-APIFY_INPUT_JSON = '{"searchTerms":["BTC"],"sort":"Latest","maxItems":20,"includeSearchTerms":false,"start":"{{since}}","end":"{{until}}"}'
+APIFY_ACTOR_ID = "kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest"
+APIFY_INPUT_JSON = '{"searchTerms":["BTC since_time:{{since_time}} until_time:{{until_time}}"],"queryType":"Latest","maxItems":20}'
+APP_ADMIN_PASSWORD = "replace-with-a-long-unique-passphrase"
 ```
 
-Do not include the example token literally. Save the secrets and reboot the app after
-changing them. Streamlit Cloud does not receive your local `.env` or SQLite database;
-the hosted dashboard starts with its own local database and must be populated by a data
-refresh or an import workflow.
+Do not include the example token or passphrase literally. Keep your existing Apify token
+private. Save the secrets and reboot the app after changing them. Review the Actor's
+current pricing before collecting.
+Streamlit Cloud does not receive your local `.env` or SQLite database; the hosted
+dashboard starts with its own local database and must be populated by a data refresh or
+an import workflow.
 
 ## Run the pipeline
 
@@ -77,6 +80,43 @@ cwt-agent train
 cwt-agent report
 ```
 
+Train an optional local text-sentiment classifier from the headerless Sentiment140
+dataset, then run `cwt-agent train` to use it when building forecast features:
+
+```powershell
+cwt-agent train-sentiment --dataset "C:\path\to\training.1600000.processed.noemoticon.csv"
+cwt-agent train
+```
+
+The sentiment command uses a stable text-hash holdout and reports classifier accuracy
+alongside VADER's accuracy on the non-neutral subset. This measures agreement with the
+dataset's binary sentiment labels, not BTC forecast accuracy or financial sentiment
+quality.
+
+To run a daily historical BTC experiment with the semicolon-delimited `tweets.csv`
+archive, train the sentiment classifier first, then run:
+
+```powershell
+cwt-agent train-btc-archive --tweets-file "C:\path\to\tweets.csv"
+```
+
+You can provide multiple archives in priority order (the earlier file wins for a
+calendar day):
+
+```powershell
+cwt-agent train-btc-archive --tweets-file "C:\path\to\tweets.csv" "C:\path\to\bitcoin_tweets_latest.csv"
+```
+
+This command streams the archive, scores only Bitcoin-related posts within the fetched
+BTC-USD daily price history, and writes aggregated sentiment and daily forecast
+artifacts under `artifacts/btc_archive_daily/` and `reports/btc_archive_daily/`, keeping
+the existing daily model and reports untouched. It does not import the 4 GB raw archive
+into SQLite. CSV delimiters are detected, and common timestamp/text column names are
+accepted. Because some archives have no tweet IDs, a later archive's posts are skipped
+for any UTC day already represented by an earlier file. The Elon sentiment snapshots
+overlap heavily and provide weak labels, while the company-stock tweet files do not
+include BTC price targets, so they are not used to train the BTC forecaster.
+
 You can skip X ingestion with `--skip-x`. Historical posts can be imported from CSV,
 JSON, or JSONL without calling Apify:
 
@@ -84,43 +124,44 @@ JSON, or JSONL without calling Apify:
 cwt-agent run --skip-x --skip-news --tweets-file .\historical_posts.csv
 ```
 
-The importer recognizes common text fields (`text`, `fullText`, `full_text`) and
-timestamp fields (`createdAt`, `created_at`, `timestamp`, `date`). Imported posts must
-have usable text and timestamps.
+The importer matches column names without regard to capitalization, spaces, or
+underscores. It recognizes common text fields (`text`, `fullText`, `full_text`,
+`content`), timestamp fields (`createdAt`, `created_at`, `timestamp`, `datetime`,
+`date`), and post IDs such as `id` and `Tweet Id`. For example, CSV exports with
+`Text` and `Datetime` columns are supported. Engagement columns such as `like count`,
+`retweet count`, and `Follower Count` are also imported when present. Posts must have
+usable text and timestamps, and only posts inside `LOOKBACK_DAYS` are kept (180 days by
+default).
 
 ## Apify configuration and historical collection
 
 Actor input schemas differ. Confirm that `APIFY_ACTOR_ID` and `APIFY_INPUT_JSON` match
 the selected Actor. The example configuration targets
-`apidojo/twitter-scraper-lite`:
+`kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest`, which returned
+usable `text` and `createdAt` fields in a small console test:
 
 ```dotenv
-APIFY_ACTOR_ID=apidojo/twitter-scraper-lite
-APIFY_INPUT_JSON={"searchTerms":["BTC"],"sort":"Latest","maxItems":20,"includeSearchTerms":false,"start":"{{since}}","end":"{{until}}"}
+APIFY_ACTOR_ID=kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest
+APIFY_INPUT_JSON={"searchTerms":["BTC since_time:{{since_time}} until_time:{{until_time}}"],"queryType":"Latest","maxItems":20}
 ```
 
-When both top-level `start` and `end` fields are present, the app replaces them with
-consecutive monthly windows covering `LOOKBACK_DAYS` and starts one Actor run per
-window. A 180-day collection therefore typically starts about six or seven Actor runs.
-It combines the datasets, normalizes posts, filters to the lookback, and deduplicates
-posts by ID.
+This Actor uses `queryType` (not `sort`) and `searchTerms`; its `searchTerms` field
+overrides `twitterContent`. Its documentation says the older `since`/`until` filters
+may be unreliable, and recommends `since_time`/`until_time` Unix-second operators.
+For this Actor, the app expands the placeholders into one query per UTC day and submits
+those daily queries in one run. With a 180-day lookback, `maxItems: 20` applies to each
+of about 180 terms—not to the whole collection. The Actor describes `maxItems` as a
+minimum rather than a strict cap, and warns that pagination may return extra results.
 
 Review current Actor pricing before collecting. Test one or two date windows in Apify
-Console first, confirm returned timestamps match the requested dates, and keep an
-appropriate maximum-cost limit enabled. Verify whether the provider's cost limit applies
-to API-triggered runs. The dashboard's **Refresh data** button starts the configured
-collection, so it may incur the cost of all monthly runs. `maxItems` is the Actor-side
-result cap **per window**;
-`APIFY_MAX_DATASET_ITEMS` is the client-side dataset download cap **per run**. Neither
-setting guarantees broad date coverage. Increase result limits only after checking the
-Actor's pricing and the pilot results.
-
-For Actors that use date operators inside search terms, the older `{{since}}` and
-`{{until}}` placeholder expansion remains supported. Use the date-filter format
-documented by the selected Actor; no date slicing occurs if the input has neither
-top-level date fields nor both query placeholders. Sparse-coverage warnings are
-intentional: they indicate that the collected rows are not sufficient for reliable
-sentiment conclusions.
+Console first, confirm returned timestamps match the requested dates, and check the
+bill before a full refresh. At the listed $0.18–$0.25 per 1,000 results, 20 results
+for each of 180 daily queries would cost roughly $0.65–$0.90 if all queries return that
+amount; actual output and pricing may differ. The app does not pass Apify's
+`maxTotalChargeUsd` run limit, so a Console-only cost limit does not protect API runs.
+`APIFY_MAX_DATASET_ITEMS` is the client-side dataset download cap per run. Neither it
+nor `maxItems` guarantees broad date coverage. Sparse-coverage warnings indicate that
+the collected rows are not sufficient for reliable sentiment conclusions.
 
 ## Dashboard
 
@@ -145,6 +186,12 @@ aliases are supported). The dashboard imports only posts within `LOOKBACK_DAYS` 
 the currently selected asset, then immediately refreshes the sentiment views. Streamlit
 Cloud does not share the local database, and its app-local SQLite data may be lost when
 the hosted app is restarted or redeployed; keep the source export so you can re-import it.
+
+The **Reset application data** control clears stored prices, X posts, news, models, and
+reports for all assets. It first provides a downloadable ZIP backup and then requires
+the `APP_ADMIN_PASSWORD` secret plus the exact confirmation text. Configure a unique
+private passphrase in local `.env` or Streamlit Cloud **Settings → Secrets** before use.
+The backup excludes credentials and source code.
 
 ## Evaluation notes and limitations
 

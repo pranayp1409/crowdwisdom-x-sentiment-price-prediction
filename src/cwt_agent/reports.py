@@ -19,6 +19,7 @@ def write_evaluation_report(
     forecasts: dict[str, float],
     path: Path,
     data_quality: dict[str, int | float | str | None] | None = None,
+    sentiment_method: str = "VADER",
 ) -> None:
     lines = [
         f"# {asset} sentiment + price evaluation",
@@ -26,7 +27,9 @@ def write_evaluation_report(
         f"- Bar interval: {interval}",
         "- Validation: expanding-window walk-forward splits with a five-bar purge gap.",
         "- Inputs: X sentiment and price-derived features only; news is excluded from model inputs.",
+        f"- Sentiment feature scorer: {sentiment_method}.",
         "- n+0 is the latest observed completed bar close; it is a baseline, not a model prediction.",
+        "- Walk-forward metrics show the raw Random Forest candidate; displayed forecasts fall back to persistence when its MAE does not beat the baseline.",
         "- Trading metrics are historical estimates; the stated round-trip cost is assumed, and actual fees/slippage may differ.",
         "- Directional strategy metrics use non-overlapping horizon-length trades and the configured round-trip cost.",
         "",
@@ -57,12 +60,18 @@ def write_evaluation_report(
         [
             "## Latest price forecast",
             "",
-            "| Horizon | Price |",
-            "|---|---:|",
+            "| Horizon | Price | Source |",
+            "|---|---:|---|",
         ]
     )
     for horizon, price in forecasts.items():
-        lines.append(f"| {horizon} | {price:.6g} |")
+        if horizon == "n+0":
+            source = "Observed close"
+        elif metrics.get(horizon, {}).get("mae_improvement_vs_persistence_pct", 0) > 0:
+            source = "Random Forest"
+        else:
+            source = "Persistence fallback"
+        lines.append(f"| {horizon} | {price:.6g} | {source} |")
     lines.extend(
         [
             "",
@@ -80,6 +89,20 @@ def write_evaluation_report(
             f"{values['sharpe_ratio']:.3f} | {values['sortino_ratio']:.3f} | "
             f"{values['max_drawdown']:.3%} | {values['oos_samples']} | "
             f"{values['non_overlapping_trades']} |"
+        )
+    underperforming_horizons = [
+        horizon
+        for horizon, values in metrics.items()
+        if values["mae_improvement_vs_persistence_pct"] <= 0
+    ]
+    if underperforming_horizons:
+        lines.extend(
+            [
+                "",
+                "> **Warning:** Walk-forward MAE did not beat the persistence baseline for "
+                f"{', '.join(underperforming_horizons)}. The model has not demonstrated "
+                "a price-forecasting edge at those horizons.",
+            ]
         )
     lines.extend(
         [

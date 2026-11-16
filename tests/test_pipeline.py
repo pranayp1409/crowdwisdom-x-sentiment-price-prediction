@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,7 @@ import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from cwt_agent.config import Settings
+from cwt_agent.archive_data import aggregate_bitcoin_tweet_archive
 from cwt_agent.database import Database
 from cwt_agent.features import build_feature_frame
 from cwt_agent.features import sentiment_coverage
@@ -20,7 +22,11 @@ from cwt_agent.providers import (
     normalize_tweets,
     parse_tweet_export,
 )
-from cwt_agent.reports import create_charts, write_sentiment_summary
+from cwt_agent.reports import create_charts, write_evaluation_report, write_sentiment_summary
+from cwt_agent.sentiment_model import (
+    load_sentiment_classifier,
+    train_sentiment_classifier,
+)
 
 
 def test_normalize_tweets_maps_common_actor_fields() -> None:
@@ -244,6 +250,94 @@ def test_apify_date_placeholders_batch_months_in_one_run(monkeypatch) -> None:
     assert len(rows) == 1
     assert all("{{since}}" not in term for term in calls[0]["searchTerms"])
     assert all("{{until}}" not in term for term in calls[0]["searchTerms"])
+
+
+def test_apify_timestamp_placeholders_batch_daily_queries_in_one_run(monkeypatch) -> None:
+    import cwt_agent.providers as providers
+
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    windows = [
+        (
+            (today - pd.Timedelta(days=1)).date().isoformat(),
+            today.date().isoformat(),
+        ),
+        (
+            today.date().isoformat(),
+            (today + pd.Timedelta(days=1)).date().isoformat(),
+        ),
+    ]
+    monkeypatch.setattr(providers, "_daily_date_windows", lambda _: windows)
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs["json"])
+        return Response(
+            {
+                "data": {
+                    "id": "run-1",
+                    "status": "SUCCEEDED",
+                    "defaultDatasetId": "dataset-1",
+                }
+            }
+        )
+
+    records = [
+        {
+            "id": f"post-{index}",
+            "createdAt": (
+                pd.Timestamp(since, tz="UTC") + pd.Timedelta(hours=6)
+            ).isoformat(),
+            "text": "BTC daily-window post",
+        }
+        for index, (since, _) in enumerate(windows)
+    ]
+
+    def fake_get(url, **kwargs):
+        return Response(records)
+
+    monkeypatch.setattr("cwt_agent.providers.requests.post", fake_post)
+    monkeypatch.setattr("cwt_agent.providers.requests.get", fake_get)
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=Path("unused.sqlite3"),
+        artifacts_dir=Path("unused-models"),
+        reports_dir=Path("unused-reports"),
+        apify_api_token="unit-test-token",
+        apify_actor_id="kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest",
+        apify_input_json=(
+            '{"searchTerms":["BTC since_time:{{since_time}} '
+            'until_time:{{until_time}}"],"queryType":"Latest","maxItems":20}'
+        ),
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+
+    rows = fetch_tweets(settings)
+
+    expected_terms = [
+        "BTC since_time:"
+        + str(int(pd.Timestamp(since, tz="UTC").timestamp()))
+        + " until_time:"
+        + str(int(pd.Timestamp(until, tz="UTC").timestamp()))
+        for since, until in windows
+    ]
+    assert len(calls) == 1
+    assert calls[0]["searchTerms"] == expected_terms
+    assert calls[0]["queryType"] == "Latest"
+    assert calls[0]["maxItems"] == 20
+    assert len(rows) == 2
 
 
 def test_apify_start_end_fields_run_each_month_and_deduplicate(monkeypatch) -> None:
@@ -504,6 +598,106 @@ def test_sentiment_features_are_equal_weight_and_mark_missing_bars() -> None:
     assert coverage["bar_count"] == 30
 
 
+def test_sentiment_classifier_training_and_feature_scoring(tmp_path) -> None:
+    import csv
+
+    dataset_path = tmp_path / "small-sentiment140.csv"
+    with dataset_path.open("w", encoding="latin-1", newline="") as stream:
+        writer = csv.writer(stream)
+        for label, phrase in ((0, "terrible disappointing"), (4, "excellent wonderful")):
+            for index in range(100):
+                writer.writerow(
+                    [
+                        label,
+                        index,
+                        "Mon Apr 06 22:19:45 PDT 2009",
+                        "NO_QUERY",
+                        "user",
+                        f"{phrase} movie message number {index}",
+                    ]
+                )
+
+    model_path = tmp_path / "artifacts" / "tweet_sentiment.joblib"
+    evaluation_path = tmp_path / "reports" / "sentiment.json"
+    metrics = train_sentiment_classifier(
+        dataset_path, model_path, evaluation_path, batch_size=20
+    )
+    classifier = load_sentiment_classifier(model_path)
+    scores = classifier.score(
+        ["excellent wonderful movie", "terrible disappointing movie"]
+    )
+
+    assert model_path.is_file()
+    assert evaluation_path.is_file()
+    assert metrics["train_rows"] + metrics["validation_rows"] == 200
+    assert metrics["validation_rows"] > 0
+    assert scores[0] > scores[1]
+
+    index = pd.date_range("2026-01-01", periods=48, freq="h", tz="UTC")
+    prices = pd.DataFrame({"close": range(100, 148)}, index=index)
+    posts = pd.DataFrame(
+        {
+            "timestamp": [index[30], index[30]],
+            "text": ["excellent wonderful movie", "terrible disappointing movie"],
+        }
+    )
+    scored_frame, _ = build_feature_frame(
+        prices, posts, "hourly", sentiment_model_path=model_path
+    )
+    expected_mean = float(sum(scores) / len(scores))
+    assert scored_frame.loc[index[30], "sentiment_mean"] == pytest.approx(expected_mean)
+
+    archive_path = tmp_path / "tweets.csv"
+    with archive_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, delimiter=";")
+        writer.writerow(
+            ["id", "user", "fullname", "url", "timestamp", "replies", "likes", "retweets", "text"]
+        )
+        writer.writerow(
+            ["1", "u1", "name", "url", "2026-01-31 08:00:00+00", 0, 0, 0, "Bitcoin is excellent"]
+        )
+        writer.writerow(
+            ["2", "u2", "name", "url", "2026-01-31 09:00:00+00", 0, 0, 0, "BTC is terrible"]
+        )
+        writer.writerow(
+            ["3", "u3", "name", "url", "2026-01-31 10:00:00+00", 0, 0, 0, "Unrelated post"]
+        )
+    latest_archive_path = tmp_path / "latest-tweets.csv"
+    with latest_archive_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["date", "text", "is_retweet"])
+        writer.writerow(["2026-01-31 11:00:00", "Bitcoin duplicate day", "False"])
+        writer.writerow(["2026-02-01 11:00:00", "Bitcoin adds a new day", "False"])
+    archive_sentiment, archive_stats = aggregate_bitcoin_tweet_archive(
+        [archive_path, latest_archive_path],
+        model_path,
+        pd.Timestamp("2026-01-01", tz="UTC"),
+        pd.Timestamp("2026-02-01", tz="UTC"),
+    )
+    assert archive_stats["scored_rows"] == 3
+    assert archive_stats["overlapping_days_skipped"] == 1
+    assert archive_stats["overlapping_rows_skipped"] == 1
+    assert archive_sentiment.loc[pd.Timestamp("2026-01-31", tz="UTC"), "post_volume"] == 2
+    assert archive_sentiment.loc[pd.Timestamp("2026-02-01", tz="UTC"), "post_volume"] == 1
+
+    daily_index = pd.date_range("2026-01-01", periods=40, freq="D", tz="UTC")
+    daily_prices = pd.DataFrame({"close": range(100, 140)}, index=daily_index)
+    daily_posts = pd.DataFrame(
+        {
+            "timestamp": [daily_index[30], daily_index[30]],
+            "text": ["excellent wonderful movie", "terrible disappointing movie"],
+        }
+    )
+    combined_frame, _ = build_feature_frame(
+        daily_prices,
+        daily_posts,
+        "daily",
+        sentiment_model_path=model_path,
+        precomputed_sentiment=archive_sentiment,
+    )
+    assert combined_frame.loc[daily_index[30], "post_volume"] == 4
+
+
 def test_dashboard_imports_uploaded_tweet_file(monkeypatch, tmp_path) -> None:
     from streamlit.testing.v1 import AppTest
 
@@ -537,11 +731,160 @@ def test_dashboard_imports_uploaded_tweet_file(monkeypatch, tmp_path) -> None:
     assert imported.iloc[0]["text"] == "BTC update"
 
 
+def test_database_clear_all_data_removes_every_table(tmp_path) -> None:
+    database = Database(tmp_path / "agent.sqlite3")
+    database.save_prices(
+        "BTC-USD",
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 100.0,
+            }
+        ],
+    )
+    database.save_tweets(
+        "BTC-USD",
+        [
+            {
+                "id": "post-1",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "text": "BTC test post",
+                "likes": 0.0,
+                "reposts": 0.0,
+                "views": 0.0,
+                "followers": 0.0,
+            }
+        ],
+    )
+    database.save_news(
+        "BTC-USD",
+        [
+            {
+                "url": "https://example.test/news",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "title": "Test news",
+                "content": "Test content",
+                "source": "test",
+            }
+        ],
+    )
+
+    assert database.clear_all_data() == {"prices": 1, "tweets": 1, "news": 1}
+    assert database.load_prices("BTC-USD").empty
+    assert database.load_tweets("BTC-USD").empty
+    assert database.load_news("BTC-USD").empty
+
+
+def test_dashboard_data_reset_requires_admin_and_clears_generated_data(
+    monkeypatch, tmp_path
+) -> None:
+    import zipfile
+    from io import BytesIO
+
+    from streamlit.testing.v1 import AppTest
+
+    from cwt_agent.dashboard import _build_data_backup
+
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=tmp_path / "data" / "agent.sqlite3",
+        artifacts_dir=tmp_path / "artifacts",
+        reports_dir=tmp_path / "reports",
+        apify_api_token=None,
+        apify_actor_id=None,
+        apify_input_json=None,
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+    database = Database(settings.database_path)
+    database.save_tweets(
+        "BTC-USD",
+        [
+            {
+                "id": "post-1",
+                "timestamp": "2026-11-14T12:00:00+00:00",
+                "text": "BTC test post",
+                "likes": 0.0,
+                "reposts": 0.0,
+                "views": 0.0,
+                "followers": 0.0,
+            }
+        ],
+    )
+    database.save_news(
+        "BTC-USD",
+        [
+            {
+                "url": "https://example.test/news",
+                "timestamp": "2026-11-14T12:00:00+00:00",
+                "title": "Test news",
+                "content": "Test content",
+                "source": "test",
+            }
+        ],
+    )
+    settings.artifacts_dir.mkdir()
+    settings.reports_dir.mkdir()
+    (settings.artifacts_dir / "model.joblib").write_bytes(b"model")
+    (settings.reports_dir / "report.md").write_text("report", encoding="utf-8")
+
+    backup = _build_data_backup(
+        settings.database_path, settings.artifacts_dir, settings.reports_dir
+    )
+    with zipfile.ZipFile(BytesIO(backup)) as archive:
+        assert set(archive.namelist()) == {
+            "database/agent.sqlite3",
+            "artifacts/model.joblib",
+            "reports/report.md",
+        }
+
+    monkeypatch.setattr(Settings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setenv("APP_ADMIN_PASSWORD", "test-admin-passphrase")
+    app_path = Path(__file__).parents[1] / "src" / "cwt_agent" / "dashboard.py"
+    app = AppTest.from_file(str(app_path)).run()
+    assert not app.exception
+
+    app.session_state["app_data_backup_downloaded"] = True
+    app.run()
+    app.text_input(key="app_reset_password").set_value("wrong")
+    app.text_input(key="app_reset_confirmation").set_value("DELETE ALL DATA")
+    app.form_submit_button(key="app_reset_submit").click().run()
+    assert not app.exception
+    assert len(database.load_tweets("BTC-USD")) == 1
+
+    app.text_input(key="app_reset_password").set_value("test-admin-passphrase")
+    app.form_submit_button(key="app_reset_submit").click().run()
+
+    assert not app.exception
+    assert database.load_tweets("BTC-USD").empty
+    assert database.load_news("BTC-USD").empty
+    assert list(settings.artifacts_dir.iterdir()) == []
+    assert list(settings.reports_dir.iterdir()) == []
+
+
 def test_monthly_apify_windows_are_contiguous_and_expand_over_lookback() -> None:
     windows = _monthly_date_windows(180)
     assert len(windows) >= 6
     assert windows[0][0] < windows[-1][1]
     assert all(windows[index][1] == windows[index + 1][0] for index in range(len(windows) - 1))
+
+
+def test_daily_apify_windows_cover_lookback_with_contiguous_days() -> None:
+    from cwt_agent.providers import _daily_date_windows
+
+    windows = _daily_date_windows(180)
+    assert len(windows) == 180
+    assert all(windows[index][1] == windows[index + 1][0] for index in range(len(windows) - 1))
+    assert all(
+        pd.Timestamp(until) - pd.Timestamp(since) == pd.Timedelta(days=1)
+        for since, until in windows
+    )
 
 
 def test_metrics_compare_persistence_and_use_non_overlapping_costed_trades() -> None:
@@ -562,6 +905,30 @@ def test_metrics_compare_persistence_and_use_non_overlapping_costed_trades() -> 
     assert metrics["mae_improvement_vs_persistence_pct"] == 50.0
     assert metrics["non_overlapping_trades"] == 2
     assert metrics["transaction_cost_bps_round_trip"] == 10
+
+
+def test_daily_trading_metrics_use_365_day_annualization() -> None:
+    rows = [
+        {
+            "base_close": 100.0,
+            "actual_close": actual_close,
+            "predicted_close": predicted_close,
+            "actual_return_pct": actual_return,
+            "predicted_return_pct": predicted_return,
+        }
+        for actual_close, predicted_close, actual_return, predicted_return in [
+            (101.0, 101.5, 1.0, 1.5),
+            (99.0, 99.5, -1.0, -0.5),
+            (102.0, 101.0, 2.0, 1.0),
+        ]
+    ]
+
+    daily = _metrics(rows, "daily", transaction_cost_bps=0)
+    hourly = _metrics(rows, "hourly", transaction_cost_bps=0)
+
+    assert daily["sharpe_ratio"] == pytest.approx(
+        hourly["sharpe_ratio"] * (1 / 24) ** 0.5
+    )
 
 
 def test_walk_forward_training_forecasts_from_latest_bar(tmp_path) -> None:
@@ -588,7 +955,17 @@ def test_walk_forward_training_forecasts_from_latest_bar(tmp_path) -> None:
     assert forecasts["n+0"] == close.iloc[-1]
     assert predictions["horizon"].nunique() == 5
     assert all(values["oos_samples"] > 0 for values in metrics.values())
-    assert (tmp_path / "reports" / "BTC-USD_hourly_forecast.json").is_file()
+    forecast_path = tmp_path / "reports" / "BTC-USD_hourly_forecast.json"
+    assert forecast_path.is_file()
+    forecast_payload = json.loads(forecast_path.read_text(encoding="utf-8"))
+    assert forecast_payload["forecast_sources"]["n+0"] == "observed_close"
+    for horizon in range(1, 6):
+        key = f"n+{horizon}"
+        if metrics[key]["mae_improvement_vs_persistence_pct"] <= 0:
+            assert forecast_payload["forecast_sources"][key] == "persistence_baseline"
+            assert forecasts[key] == close.iloc[-1]
+        else:
+            assert forecast_payload["forecast_sources"][key] == "random_forest"
     assert set(metrics["n+5"]) >= {
         "persistence_mae",
         "majority_direction_accuracy",
@@ -604,6 +981,22 @@ def test_walk_forward_training_forecasts_from_latest_bar(tmp_path) -> None:
     )
     assert len(chart_paths) == 2
     assert all(path.is_file() for path in chart_paths)
+    report_path = tmp_path / "reports" / "evaluation.md"
+    write_evaluation_report(
+        "BTC-USD",
+        "hourly",
+        {
+            "n+1": {
+                **metrics["n+1"],
+                "mae_improvement_vs_persistence_pct": -1.0,
+            }
+        },
+        forecasts,
+        report_path,
+    )
+    assert "did not beat the persistence baseline for n+1" in report_path.read_text(
+        encoding="utf-8"
+    )
     summary_path = tmp_path / "reports" / "summary.md"
     write_sentiment_summary(
         "BTC-USD", frame[["close"]], pd.DataFrame(), pd.DataFrame(), summary_path
@@ -644,3 +1037,46 @@ def test_metrics_from_saved_predictions_and_local_news_summary() -> None:
     )
     assert "Bitcoin rises after strong demand." in summary
     assert "Bitcoin demand lifts the market." in summary
+
+
+def test_dashboard_loads_forecast_sources_and_accepts_legacy_forecast_files(
+    tmp_path,
+) -> None:
+    from cwt_agent.dashboard import _load_forecast_sources
+
+    reports_dir = tmp_path / "reports"
+    settings = Settings(
+        asset="BTC-USD",
+        interval="hourly",
+        lookback_days=180,
+        database_path=tmp_path / "agent.sqlite3",
+        artifacts_dir=tmp_path / "artifacts",
+        reports_dir=reports_dir,
+        apify_api_token=None,
+        apify_actor_id=None,
+        apify_input_json=None,
+        tavily_api_key=None,
+        exa_api_key=None,
+    )
+    assert _load_forecast_sources(settings) == {}
+
+    reports_dir.mkdir()
+    forecast_path = reports_dir / "BTC-USD_hourly_forecast.json"
+    forecast_path.write_text(
+        json.dumps(
+            {
+                "forecast_sources": {
+                    "n+0": "observed_close",
+                    "n+1": "persistence_baseline",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _load_forecast_sources(settings) == {
+        "n+0": "observed_close",
+        "n+1": "persistence_baseline",
+    }
+
+    forecast_path.write_text(json.dumps({"forecasts": {"n+0": 100}}), encoding="utf-8")
+    assert _load_forecast_sources(settings) == {}

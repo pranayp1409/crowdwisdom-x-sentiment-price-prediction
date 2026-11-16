@@ -44,6 +44,8 @@ def train_and_evaluate(
     metrics: dict[str, Any] = {}
     prediction_rows: list[dict[str, Any]] = []
     live_forecasts: dict[str, float] = {}
+    forecast_sources = {"n+0": "observed_close"}
+    current_price = float(frame["close"].iloc[-1])
     for horizon in range(1, 6):
         target_column = f"target_{horizon}"
         y = training_frame[target_column].astype(float) / training_frame["close"] - 1
@@ -81,9 +83,13 @@ def train_and_evaluate(
         final_model.fit(x, y)
         latest_x = frame[feature_columns].iloc[[-1]].astype(float)
         predicted_return = max(float(final_model.predict(latest_x)[0]), -0.999999)
-        live_forecasts[f"n+{horizon}"] = float(frame["close"].iloc[-1]) * (
-            1 + predicted_return
-        )
+        key = f"n+{horizon}"
+        if metrics[key]["mae_improvement_vs_persistence_pct"] <= 0:
+            live_forecasts[key] = current_price
+            forecast_sources[key] = "persistence_baseline"
+        else:
+            live_forecasts[key] = current_price * (1 + predicted_return)
+            forecast_sources[key] = "random_forest"
         model_path = artifacts_dir / f"{_safe_asset(asset)}_{interval}_h{horizon}.joblib"
         joblib.dump(
             {
@@ -99,7 +105,6 @@ def train_and_evaluate(
     predictions_frame = pd.DataFrame(prediction_rows).sort_values(["timestamp", "horizon"])
     predictions_path = reports_dir / f"{_safe_asset(asset)}_{interval}_oos_predictions.csv"
     predictions_frame.to_csv(predictions_path, index=False)
-    current_price = float(frame["close"].iloc[-1])
     forecasts = {"n+0": current_price, **live_forecasts}
     forecast_path = reports_dir / f"{_safe_asset(asset)}_{interval}_forecast.json"
     forecast_path.write_text(
@@ -109,6 +114,11 @@ def train_and_evaluate(
                 "interval": interval,
                 "generated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
                 "n+0_semantics": "latest observed completed bar close (baseline, not a model prediction)",
+                "forecast_selection_rule": (
+                    "Use the Random Forest only when its walk-forward MAE beats "
+                    "persistence; otherwise carry forward the latest observed close."
+                ),
+                "forecast_sources": forecast_sources,
                 "forecasts": forecasts,
             },
             indent=2,
@@ -154,7 +164,7 @@ def _metrics(
     peak = np.maximum.accumulate(np.concatenate(([1.0], equity)))[1:]
     drawdowns = equity / peak - 1
     downside_deviation = float(np.sqrt(np.mean(np.minimum(strategy_returns, 0) ** 2)))
-    periods_per_year = (24 * 365 if interval == "hourly" else 252) / horizon
+    periods_per_year = (24 * 365 if interval == "hourly" else 365) / horizon
     strategy_std = float(np.std(strategy_returns, ddof=1)) if len(strategy_returns) > 1 else 0.0
     persistence_errors = actual - persistence_predictions
     actual_directions = np.sign(actual_returns)

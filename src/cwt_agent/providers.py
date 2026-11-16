@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -99,16 +100,24 @@ def _first(record: dict[str, Any], names: tuple[str, ...], default: Any = 0) -> 
         value = record.get(name)
         if value is not None:
             return value
+    normalized_record = {
+        re.sub(r"[^a-z0-9]", "", str(key).lower()): value
+        for key, value in record.items()
+    }
+    for name in names:
+        value = normalized_record.get(re.sub(r"[^a-z0-9]", "", name.lower()))
+        if value is not None:
+            return value
     return default
 
 
 def normalize_tweets(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for record in records:
-        text = _first(record, ("text", "fullText", "full_text", "content"), "")
+        text = _first(record, ("text", "fullText", "full_text", "content", "tweetText"), "")
         timestamp = _first(
             record,
-            ("createdAt", "created_at", "timestamp", "date", "postedAt"),
+            ("createdAt", "created_at", "timestamp", "datetime", "date", "postedAt"),
             None,
         )
         if text is None or (not isinstance(text, (dict, list)) and pd.isna(text)):
@@ -133,7 +142,7 @@ def normalize_tweets(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         views = _first(record, ("viewCount", "view_count", "views"), 0)
         followers = _first(
             record,
-            ("authorFollowers", "followersCount", "followers_count"),
+            ("authorFollowers", "followersCount", "followers_count", "followerCount"),
             _first(user, ("followersCount", "followers_count", "followers"), 0),
         )
         post_id = _first(record, ("id", "id_str", "tweetId", "url"), None)
@@ -258,13 +267,24 @@ def fetch_tweets(settings: Settings) -> list[dict[str, Any]]:
     has_until = "{{until}}" in serialized_input
     if has_since != has_until:
         raise ValueError("APIFY_INPUT_JSON must include both {{since}} and {{until}}, or neither.")
+    has_since_time = "{{since_time}}" in serialized_input
+    has_until_time = "{{until_time}}" in serialized_input
+    if has_since_time != has_until_time:
+        raise ValueError(
+            "APIFY_INPUT_JSON must include both {{since_time}} and {{until_time}}, or neither."
+        )
     has_start = "start" in actor_input
     has_end = "end" in actor_input
     if has_start != has_end:
         raise ValueError("APIFY_INPUT_JSON must include both 'start' and 'end' date fields.")
+    if has_since_time and (has_since or has_start):
+        raise ValueError("APIFY_INPUT_JSON must use only one date-filter placeholder format.")
 
     windows: list[tuple[str, str]] = []
-    if has_start:
+    if has_since_time:
+        windows = _daily_date_windows(settings.lookback_days)
+        actor_inputs = [_expand_timestamp_queries(actor_input, windows)]
+    elif has_start:
         windows = _monthly_date_windows(settings.lookback_days)
         actor_inputs = [
             {**actor_input, "start": since, "end": until}
@@ -338,29 +358,63 @@ def fetch_tweets(settings: Settings) -> list[dict[str, Any]]:
 def _expand_date_queries(
     actor_input: Any, windows: list[tuple[str, str]]
 ) -> Any:
+    return _expand_query_placeholders(actor_input, windows, "{{since}}", "{{until}}")
+
+
+def _expand_timestamp_queries(
+    actor_input: Any, windows: list[tuple[str, str]]
+) -> Any:
+    timestamp_windows = [
+        (
+            str(int(pd.Timestamp(since, tz="UTC").timestamp())),
+            str(int(pd.Timestamp(until, tz="UTC").timestamp())),
+        )
+        for since, until in windows
+    ]
+    return _expand_query_placeholders(
+        actor_input, timestamp_windows, "{{since_time}}", "{{until_time}}"
+    )
+
+
+def _expand_query_placeholders(
+    actor_input: Any,
+    windows: list[tuple[str, str]],
+    since_placeholder: str,
+    until_placeholder: str,
+) -> Any:
     if isinstance(actor_input, dict):
         return {
-            key: _expand_date_queries(value, windows)
+            key: _expand_query_placeholders(
+                value, windows, since_placeholder, until_placeholder
+            )
             for key, value in actor_input.items()
         }
     if isinstance(actor_input, list):
         expanded: list[Any] = []
         for value in actor_input:
-            if isinstance(value, str) and ("{{since}}" in value or "{{until}}" in value):
-                if "{{since}}" not in value or "{{until}}" not in value:
+            if isinstance(value, str) and (
+                since_placeholder in value or until_placeholder in value
+            ):
+                if since_placeholder not in value or until_placeholder not in value:
                     raise ValueError(
                         "Each APIFY_INPUT_JSON date query must include both "
-                        "{{since}} and {{until}}."
+                        f"{since_placeholder} and {until_placeholder}."
                     )
                 expanded.extend(
-                    value.replace("{{since}}", since).replace("{{until}}", until)
+                    value.replace(since_placeholder, since).replace(
+                        until_placeholder, until
+                    )
                     for since, until in windows
                 )
             else:
-                expanded.append(_expand_date_queries(value, windows))
+                expanded.append(
+                    _expand_query_placeholders(
+                        value, windows, since_placeholder, until_placeholder
+                    )
+                )
         return expanded
     if isinstance(actor_input, str) and (
-        "{{since}}" in actor_input or "{{until}}" in actor_input
+        since_placeholder in actor_input or until_placeholder in actor_input
     ):
         raise ValueError(
             "Put date placeholders inside an APIFY_INPUT_JSON array such as searchTerms."
@@ -490,6 +544,18 @@ def _monthly_date_windows(lookback_days: int) -> list[tuple[str, str]]:
     while cursor < end:
         next_month = (cursor + pd.offsets.MonthBegin(1)).normalize()
         window_end = min(next_month, end)
+        windows.append((cursor.date().isoformat(), window_end.date().isoformat()))
+        cursor = window_end
+    return windows
+
+
+def _daily_date_windows(lookback_days: int) -> list[tuple[str, str]]:
+    end = pd.Timestamp.now(tz="UTC").normalize() + pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=lookback_days)
+    windows: list[tuple[str, str]] = []
+    cursor = start
+    while cursor < end:
+        window_end = min(cursor + pd.Timedelta(days=1), end)
         windows.append((cursor.date().isoformat(), window_end.date().isoformat()))
         cursor = window_end
     return windows

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+from cwt_agent.sentiment_model import load_sentiment_classifier
 
 
 def build_feature_frame(
     prices: pd.DataFrame,
     tweets: pd.DataFrame,
     interval: str,
+    sentiment_model_path: Path | None = None,
+    precomputed_sentiment: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     if prices.empty:
         raise ValueError("No price history is stored. Run the ingest command first.")
@@ -21,7 +27,11 @@ def build_feature_frame(
     bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
     bars = bars.dropna(subset=["close"])
 
-    sentiment = _aggregate_sentiment(tweets, frequency)
+    sentiment = _aggregate_sentiment(tweets, frequency, sentiment_model_path)
+    if precomputed_sentiment is not None:
+        sentiment = _combine_sentiment(
+            sentiment, precomputed_sentiment, frequency
+        )
     frame = bars.join(sentiment, how="left")
     frame["sentiment_available"] = frame["post_volume"].notna().astype(float)
     frame[["sentiment_mean", "positive_share", "post_volume"]] = (
@@ -105,22 +115,34 @@ def sentiment_coverage(
     }
 
 
-def _aggregate_sentiment(tweets: pd.DataFrame, frequency: str) -> pd.DataFrame:
+def _aggregate_sentiment(
+    tweets: pd.DataFrame,
+    frequency: str,
+    sentiment_model_path: Path | None = None,
+) -> pd.DataFrame:
     columns = ["sentiment_mean", "positive_share", "post_volume"]
     if tweets.empty:
         return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz="UTC"))
     if not {"timestamp", "text"}.issubset(tweets.columns):
         raise ValueError("Tweet data must include timestamp and text columns.")
-    analyzer = SentimentIntensityAnalyzer()
     posts = tweets.copy()
     posts["timestamp"] = pd.to_datetime(posts["timestamp"], utc=True, errors="coerce")
     posts = posts.dropna(subset=["timestamp"])
     if posts.empty:
         return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz="UTC"))
     posts["period"] = posts["timestamp"].dt.floor(frequency)
-    posts["sentiment"] = posts["text"].fillna("").map(
-        lambda text: analyzer.polarity_scores(str(text))["compound"]
-    )
+    texts = posts["text"].fillna("").astype(str).tolist()
+    if sentiment_model_path is None:
+        analyzer = SentimentIntensityAnalyzer()
+        posts["sentiment"] = [
+            analyzer.polarity_scores(text)["compound"] for text in texts
+        ]
+    else:
+        if not sentiment_model_path.is_file():
+            raise FileNotFoundError(
+                f"Sentiment model does not exist: {sentiment_model_path}"
+            )
+        posts["sentiment"] = load_sentiment_classifier(sentiment_model_path).score(texts)
     posts["is_positive"] = (posts["sentiment"] > 0).astype(float)
     grouped = posts.groupby("period", sort=True)
     result = grouped.agg(
@@ -129,3 +151,53 @@ def _aggregate_sentiment(tweets: pd.DataFrame, frequency: str) -> pd.DataFrame:
         post_volume=("sentiment", "size"),
     )
     return result[columns]
+
+
+def _combine_sentiment(
+    current: pd.DataFrame,
+    historical: pd.DataFrame,
+    frequency: str,
+) -> pd.DataFrame:
+    columns = ["sentiment_mean", "positive_share", "post_volume"]
+    weighted_frames = []
+    for source in (current, historical):
+        if source.empty:
+            continue
+        if not set(columns).issubset(source.columns):
+            raise ValueError(
+                "Precomputed sentiment must include sentiment_mean, positive_share, "
+                "and post_volume."
+            )
+        frame = source[columns].copy()
+        frame.index = pd.to_datetime(frame.index, utc=True).floor(frequency)
+        frame["post_volume"] = pd.to_numeric(frame["post_volume"], errors="coerce")
+        frame["sentiment_mean"] = pd.to_numeric(
+            frame["sentiment_mean"], errors="coerce"
+        )
+        frame["positive_share"] = pd.to_numeric(
+            frame["positive_share"], errors="coerce"
+        )
+        values = frame[columns].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError("Precomputed sentiment values must all be finite.")
+        if (
+            (frame["post_volume"] < 0).any()
+            or not frame["sentiment_mean"].between(-1, 1).all()
+            or not frame["positive_share"].between(0, 1).all()
+        ):
+            raise ValueError("Precomputed sentiment values are outside valid ranges.")
+        frame["sentiment_sum"] = frame["sentiment_mean"] * frame["post_volume"]
+        frame["positive_sum"] = frame["positive_share"] * frame["post_volume"]
+        weighted_frames.append(frame[["sentiment_sum", "positive_sum", "post_volume"]])
+    if not weighted_frames:
+        return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz="UTC"))
+    combined = pd.concat(weighted_frames).groupby(level=0, sort=True).sum()
+    combined = combined[combined["post_volume"] > 0]
+    return pd.DataFrame(
+        {
+            "sentiment_mean": combined["sentiment_sum"] / combined["post_volume"],
+            "positive_share": combined["positive_sum"] / combined["post_volume"],
+            "post_volume": combined["post_volume"],
+        },
+        index=combined.index,
+    )

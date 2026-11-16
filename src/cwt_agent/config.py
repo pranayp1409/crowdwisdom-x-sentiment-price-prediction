@@ -57,3 +57,7 @@ class Settings:
     @property
     def price_interval(self) -> str:
         return "1h" if self.interval == "hourly" else "1d"
+
+    @property
+    def sentiment_model_path(self) -> Path:
+        return self.artifacts_dir / "tweet_sentiment.joblib"

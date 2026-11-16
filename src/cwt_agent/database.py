@@ -102,6 +102,15 @@ class Database:
                 [dict(asset=asset, **row) for row in rows],
             )
 
+    def clear_all_data(self) -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        with self.connection() as connection:
+            for table in ("prices", "tweets", "news"):
+                deleted[table] = connection.execute(
+                    f"DELETE FROM {table}"
+                ).rowcount
+        return deleted
+
     def load_prices(self, asset: str) -> pd.DataFrame:
         with self.connection() as connection:
             frame = pd.read_sql_query(

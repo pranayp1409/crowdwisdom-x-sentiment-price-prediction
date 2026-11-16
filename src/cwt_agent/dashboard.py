@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import hmac
+import io
 import json
+import os
 import re
+import shutil
+import sqlite3
+import tempfile
+import zipfile
+from contextlib import closing
 from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 from plotly.subplots import make_subplots
+from streamlit.errors import StreamlitSecretNotFoundError
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from cwt_agent.config import Settings
@@ -104,11 +115,14 @@ def main() -> None:
         else:
             st.rerun()
 
+    _render_data_reset(database, settings)
+
     prices = database.load_prices(asset)
     tweets = database.load_tweets(asset)
     news = database.load_news(asset, limit=30)
     predictions = _load_predictions(selected_settings)
     forecasts = _load_forecasts(selected_settings)
+    forecast_sources = _load_forecast_sources(selected_settings)
     metrics = metrics_from_predictions(predictions, interval)
     st.markdown(
         '<div class="eyebrow">MARKET INTELLIGENCE · SENTIMENT & QUANT</div>',
@@ -132,7 +146,7 @@ def main() -> None:
         _render_live_metrics(prices, recent_posts, recent_score)
         _render_data_quality(prices, tweets, interval)
         _render_price_sentiment(prices, tweets, interval, window_days)
-        _render_forecasts(forecasts, prices)
+        _render_forecasts(forecasts, prices, forecast_sources)
         _render_performance(metrics)
         _render_walk_forward(predictions, metrics)
         _render_news(news)
@@ -183,6 +197,160 @@ def _render_tweet_import(
                 except ValueError as error:
                     st.error(f"Could not import the post export: {error}")
     return imported
+
+
+def _render_data_reset(database: Database, settings: Settings) -> None:
+    with st.sidebar.expander("Reset application data"):
+        st.warning(
+            "This permanently clears prices, X posts, news, saved models, and reports "
+            "for every asset. Download the backup before confirming. Credentials and "
+            "source code are not included or removed.",
+            title="Back up before clearing",
+        )
+        admin_password = _get_reset_admin_password()
+        if not admin_password:
+            st.info(
+                "Reset is locked. Configure a private APP_ADMIN_PASSWORD in local "
+                ".env or Streamlit Cloud Secrets."
+            )
+            return
+
+        try:
+            backup = _build_data_backup(
+                database.path, settings.artifacts_dir, settings.reports_dir
+            )
+        except (OSError, sqlite3.Error, ValueError) as error:
+            st.error(f"Could not prepare the backup: {error}")
+            return
+
+        downloaded = st.download_button(
+            "Download data backup",
+            data=backup,
+            file_name=(
+                f"cwt-{settings.asset.lower()}-backup-"
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.zip"
+            ),
+            mime="application/zip",
+            key="app_data_backup_download",
+            width="stretch",
+        )
+        if downloaded:
+            st.session_state["app_data_backup_downloaded"] = True
+
+        if not st.session_state.get("app_data_backup_downloaded", False):
+            st.caption("Download the backup to unlock the reset confirmation.")
+            return
+
+        with st.form("app_data_reset_form"):
+            password = st.text_input(
+                "Admin passphrase",
+                type="password",
+                key="app_reset_password",
+            )
+            confirmation = st.text_input(
+                'Type "DELETE ALL DATA" to confirm',
+                key="app_reset_confirmation",
+            )
+            submitted = st.form_submit_button(
+                "Clear all application data",
+                key="app_reset_submit",
+                width="stretch",
+            )
+
+        if submitted:
+            if not hmac.compare_digest(password, admin_password):
+                st.error("The admin passphrase is incorrect.")
+            elif confirmation != "DELETE ALL DATA":
+                st.error('Type "DELETE ALL DATA" exactly to confirm.')
+            else:
+                try:
+                    _clear_generated_directory(settings.artifacts_dir, database.path)
+                    _clear_generated_directory(settings.reports_dir, database.path)
+                    database.clear_all_data()
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    st.error(
+                        f"Reset did not finish completely: {error}. "
+                        "Restore from the downloaded backup if needed."
+                    )
+                else:
+                    st.session_state["app_data_backup_downloaded"] = False
+                    st.session_state["app_data_reset_complete"] = True
+                    st.rerun()
+
+        if st.session_state.get("app_data_reset_complete", False):
+            st.success("Application data cleared for all assets.")
+            st.session_state["app_data_reset_complete"] = False
+
+
+def _get_reset_admin_password() -> str | None:
+    password = os.getenv("APP_ADMIN_PASSWORD")
+    if password:
+        return password
+    try:
+        secret = st.secrets.get("APP_ADMIN_PASSWORD")
+    except (KeyError, StreamlitSecretNotFoundError):
+        return None
+    return str(secret) if secret else None
+
+
+def _build_data_backup(
+    database_path: Path, artifacts_dir: Path, reports_dir: Path
+) -> bytes:
+    artifact_path = _resolve_generated_directory(artifacts_dir, database_path)
+    report_path = _resolve_generated_directory(reports_dir, database_path)
+    output = io.BytesIO()
+
+    with tempfile.TemporaryDirectory(prefix="cwt-data-backup-") as temp_dir:
+        snapshot_path = Path(temp_dir) / database_path.name
+        with closing(sqlite3.connect(database_path)) as source:
+            with closing(sqlite3.connect(snapshot_path)) as snapshot:
+                source.backup(snapshot)
+
+        with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(snapshot_path, f"database/{database_path.name}")
+            for directory, prefix in (
+                (artifact_path, "artifacts"),
+                (report_path, "reports"),
+            ):
+                if directory.exists():
+                    if not directory.is_dir():
+                        raise ValueError(f"Expected a directory at {directory}.")
+                    for path in sorted(directory.rglob("*")):
+                        if path.is_file() and not path.is_symlink():
+                            archive.write(
+                                path,
+                                f"{prefix}/{path.relative_to(directory).as_posix()}",
+                            )
+
+    return output.getvalue()
+
+
+def _resolve_generated_directory(directory: Path, database_path: Path) -> Path:
+    if directory.is_symlink():
+        raise ValueError(f"Refusing to reset a symlinked output directory: {directory}.")
+    resolved = directory.resolve()
+    project_root = Path.cwd().resolve()
+    if resolved == project_root or resolved in project_root.parents:
+        raise ValueError(f"Refusing to reset a protected directory: {resolved}.")
+    database_resolved = database_path.resolve()
+    if resolved == database_resolved or database_resolved in resolved.parents:
+        raise ValueError(
+            f"Output directory {resolved} must not contain the database file."
+        )
+    return resolved
+
+
+def _clear_generated_directory(directory: Path, database_path: Path) -> None:
+    resolved = _resolve_generated_directory(directory, database_path)
+    if not resolved.exists():
+        return
+    if not resolved.is_dir():
+        raise ValueError(f"Expected a directory at {resolved}.")
+    for child in resolved.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
 
 
 def _render_live_metrics(prices: pd.DataFrame, posts: pd.DataFrame, score: float) -> None:
@@ -246,11 +414,26 @@ def _render_price_sentiment(
     )
 
 
-def _render_forecasts(forecasts: dict[str, float], prices: pd.DataFrame) -> None:
+def _render_forecasts(
+    forecasts: dict[str, float],
+    prices: pd.DataFrame,
+    forecast_sources: dict[str, str],
+) -> None:
     st.markdown('<div class="section-label">02 / SIX-HORIZON FORECAST</div>', unsafe_allow_html=True)
     if not forecasts:
         st.info("Forecast file not found. Run `cwt-agent train` to create the six-horizon output.")
         return
+    fallback_horizons = [
+        horizon
+        for horizon, source in forecast_sources.items()
+        if source == "persistence_baseline"
+    ]
+    if fallback_horizons:
+        st.info(
+            "The Random Forest did not beat persistence MAE for "
+            f"{', '.join(fallback_horizons)}. Those horizons use the latest close.",
+            title="Persistence fallback",
+        )
     price_now = float(prices["close"].iloc[-1])
     for row_start in (0, 3):
         columns = st.columns(3)
@@ -266,6 +449,13 @@ def _render_forecasts(forecasts: dict[str, float], prices: pd.DataFrame) -> None
                     else f"{(value / price_now - 1):+.2%} vs n+0"
                 )
                 column.metric(key, f"{value:,.2f}", delta)
+            source = forecast_sources.get(key)
+            source_label = {
+                "random_forest": "Random Forest",
+                "persistence_baseline": "Persistence fallback",
+            }.get(source)
+            if source_label:
+                column.caption(source_label)
     st.caption(
         "n+0 is the latest observed completed-bar close. n+1…n+5 are model forecasts, not financial advice."
     )
@@ -276,6 +466,10 @@ def _render_performance(metrics: dict[str, dict[str, float]]) -> None:
     if not metrics:
         st.info("No walk-forward predictions found. Run `cwt-agent train` to generate evaluation results.")
         return
+    st.caption(
+        "Metrics are for the raw Random Forest candidate; forecast horizons that fail "
+        "to beat persistence MAE use a persistence fallback."
+    )
     table = pd.DataFrame.from_dict(metrics, orient="index")
     table.index.name = "Horizon"
     table = table.rename(
@@ -474,6 +668,17 @@ def _load_forecasts(settings: Settings) -> dict[str, float]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     forecasts = payload.get("forecasts", {})
     return {str(key): float(value) for key, value in forecasts.items()}
+
+
+def _load_forecast_sources(settings: Settings) -> dict[str, str]:
+    path = settings.reports_dir / f"{_safe_asset(settings.asset)}_{settings.interval}_forecast.json"
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    sources = payload.get("forecast_sources", {})
+    if not isinstance(sources, dict):
+        raise ValueError("Forecast sources in the forecast file must be a JSON object.")
+    return {str(key): str(value) for key, value in sources.items()}
 
 
 def _safe_asset(asset: str) -> str:
